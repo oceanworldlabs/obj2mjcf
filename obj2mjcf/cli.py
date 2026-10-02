@@ -1,11 +1,11 @@
 """A CLI for processing composite Wavefront OBJ files into MuJoCo and/or USD assets."""
 
 import logging
-import os
 import re
 import shutil
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
 
@@ -131,7 +131,7 @@ def parse_mtl_name(lines: Iterable[str]) -> Optional[str]:
 def copy_textures(
     material: Material, src_dir: Path, work_dir: Path, resize_percent: float
 ) -> None:
-    """Copy all of a material's texture maps into ``work_dir`` (flat) and rewrite paths.
+    """Copy texture maps into ``work_dir`` and rewrite paths without basename aliases.
 
     The diffuse map is converted to PNG (MuJoCo only supports PNG textures) and resized;
     other PBR maps keep their original format for the USD emitter.
@@ -144,16 +144,18 @@ def copy_textures(
                 f"The texture file {src} referenced in the MTL file "
                 f"{material.name} does not exist"
             )
-        dst = work_dir / texture_path.name
-        shutil.copy(src, dst)
+        texture_key = f"{attr}:{texture_path.as_posix()}"
+        texture_id = sha256(texture_key.encode()).hexdigest()[:16]
+        dst = work_dir / f"{texture_id}_{texture_path.name}"
         if attr == "map_Kd" and texture_path.suffix.lower() in (".jpg", ".jpeg"):
-            image = Image.open(dst)
-            os.remove(dst)
-            dst = (work_dir / texture_path.stem).with_suffix(".png")
-            image.save(dst)
+            dst = dst.with_suffix(".png")
+            with Image.open(src) as image:
+                image.save(dst)
             resize_texture(dst, resize_percent)
-        elif attr == "map_Kd":
-            resize_texture(dst, resize_percent)
+        else:
+            shutil.copy(src, dst)
+            if attr == "map_Kd":
+                resize_texture(dst, resize_percent)
         setattr(material, attr, dst.name)
 
 
@@ -191,9 +193,6 @@ def _build_asset(
     meters_per_unit: float,
     up_axis: str,
 ) -> ProcessedAsset:
-    if up_axis.upper() not in ("Z", "Y"):
-        raise ValueError(f"up_axis must be 'Z' or 'Y', got {up_axis!r}")
-
     collision_parts: List[Path] = []
     if decompose:
         collision_parts = decompose_convex(filename, work_dir, coacd_args)
@@ -317,7 +316,18 @@ def _normalize_formats(export: Union[str, Sequence[str]]) -> List[str]:
     return _validate_formats(formats)
 
 
+def _validate_input(filename: Path, up_axis: str) -> None:
+    if not filename.is_file():
+        raise FileNotFoundError(f"OBJ file does not exist: {filename}")
+    if up_axis.upper() not in ("Z", "Y"):
+        raise ValueError(f"up_axis must be 'Z' or 'Y', got {up_axis!r}")
+
+
 def process_obj(filename: Path, args: Args) -> Dict[str, List[Path]]:
+    write = _parse_formats(args.export)
+    if args.save_mjcf and "mjcf" not in write:
+        write.append("mjcf")
+    _validate_input(filename, args.up_axis)
     work_dir = _prepare_work_dir(filename, args.overwrite)
     if work_dir is None:
         return {}
@@ -331,10 +341,6 @@ def process_obj(filename: Path, args: Args) -> Dict[str, List[Path]]:
         args.meters_per_unit,
         args.up_axis,
     )
-
-    write = _parse_formats(args.export)
-    if args.save_mjcf and "mjcf" not in write:
-        write.append("mjcf")
 
     emit_opts = EmitOpts(
         add_free_joint=args.add_free_joint,
@@ -373,6 +379,7 @@ def convert(
     """
     formats = _normalize_formats(export)  # validate before any side effects
     filename = Path(obj_path)
+    _validate_input(filename, up_axis)
     work_dir = _prepare_work_dir(filename, overwrite)
     if work_dir is None:
         return {}
